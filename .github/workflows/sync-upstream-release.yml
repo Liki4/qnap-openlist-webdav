@@ -1,3 +1,5 @@
+name: Sync and create Release
+
 on:
 #  schedule:
 #    - cron: '*/30 * * * *'
