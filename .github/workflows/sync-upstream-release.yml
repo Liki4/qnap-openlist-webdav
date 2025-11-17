@@ -10,145 +10,139 @@ permissions:
   packages: write
 
 jobs:
-  sync:
+  sync_release:
     runs-on: ubuntu-latest
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - name: Checkout master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
 
-    - name: Get latest upstream release (including prereleases)
-      id: upstream
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const owner = 'OpenListTeam';
-          const repo = 'OpenList';
-          const resp = await github.rest.repos.listReleases({ owner, repo, per_page: 100 });
-          if (!resp || !resp.data || resp.data.length === 0) {
-            core.setOutput('found', 'false');
-            return;
-          }
-          const sorted = resp.data.sort((a,b) => new Date(b.published_at) - new Date(a.published_at));
-          const latest = sorted[0];
-          core.setOutput('found', 'true');
-          core.setOutput('tag_name', latest.tag_name || '');
-          core.setOutput('prerelease', String(latest.prerelease));
-          core.setOutput('body', latest.body || '');
-          core.setOutput('html_url', latest.html_url || '');
+      - name: Get latest upstream release (non-prerelease)
+        id: upstream
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const owner = 'OpenListTeam';
+            const repo = 'OpenList';
+            try {
+              const res = await github.rest.repos.getLatestRelease({ owner, repo });
+              core.setOutput('tag_name', res.data.tag_name || '');
+              core.setOutput('body', res.data.body || '');
+              core.setOutput('html_url', res.data.html_url || '');
+            } catch (err) {
+              if (err.status === 404) {
+                core.setOutput('not_found', 'true');
+              } else {
+                throw err;
+              }
+            }
 
-    - name: Abort if no upstream release found
-      if: steps.upstream.outputs.found != 'true'
-      run: |
-        echo "No upstream releases found. Exiting."
+      - name: Abort if no upstream non-prerelease release found
+        if: steps.upstream.outputs.not_found == 'true'
+        run: |
+          echo "No upstream non-prerelease release found in OpenListTeam/OpenList. Exiting."
 
-    - name: Normalize version and read current QPKG_VER
-      id: prep
-      run: |
-        raw_tag="${{ steps.upstream.outputs.tag_name }}"
-        echo "raw_tag=$raw_tag"
-        version="${raw_tag#v}"
-        version="${version#V}"
-        echo "version=$version" >> $GITHUB_OUTPUT
+      - name: Read and normalize versions
+        id: prep
+        run: |
+          raw_tag="${{ steps.upstream.outputs.tag_name }}"
+          echo "raw_tag=$raw_tag"
+          version="${raw_tag#v}"
+          version="${version#V}"
+          echo "version=$version" >> $GITHUB_OUTPUT
 
-        if [ -f "OpenList/qpkg.cfg" ]; then
-          line=$(grep -E '^QPKG_VER' OpenList/qpkg.cfg || true)
-          if [ -n "$line" ]; then
-            cur=$(echo "$line" | sed -E 's/.*= *"?([^"]+)"?.*/\1/')
-            echo "current_ver=$cur" >> $GITHUB_OUTPUT
+          if [ -f "OpenList/qpkg.cfg" ]; then
+            cur=$(grep -E '^QPKG_VER' OpenList/qpkg.cfg | sed -E 's/.*=[[:space:]]*"?([^"]+)"?.*/\1/' || true)
+            echo "current=$cur" >> $GITHUB_OUTPUT
           else
-            echo "current_ver=" >> $GITHUB_OUTPUT
+            echo "current=" >> $GITHUB_OUTPUT
           fi
-        else
-          echo "current_ver=" >> $GITHUB_OUTPUT
-        fi
 
-    - name: Exit if already up-to-date
-      if: steps.prep.outputs.version == steps.prep.outputs.current_ver
-      run: |
-        echo "QPKG_VER already at ${{ steps.prep.outputs.version }} — nothing to do."
+      - name: Exit if already up-to-date
+        if: steps.prep.outputs.version == steps.prep.outputs.current
+        run: |
+          echo "QPKG_VER already at ${{ steps.prep.outputs.version }} — nothing to do."
 
-    - name: Bump OpenList/qpkg.cfg, commit and push branch
-      id: commit
-      if: steps.prep.outputs.version != steps.prep.outputs.current_ver
-      env:
-        NEW_VERSION: ${{ steps.prep.outputs.version }}
-        UPSTREAM_TAG: ${{ steps.upstream.outputs.tag_name }}
-      run: |
-        set -e
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        branch="bump-openlist-${NEW_VERSION}"
-        git checkout -b "$branch"
-        if [ -f "OpenList/qpkg.cfg" ]; then
-          sed -E -i 's/^(QPKG_VER[[:space:]]*=[[:space:]]*).*/\1"'"$NEW_VERSION"'"/' OpenList/qpkg.cfg
-        else
-          echo "QPKG_VER=\"$NEW_VERSION\"" > OpenList/qpkg.cfg
-        fi
-        git add OpenList/qpkg.cfg
-        if git diff --staged --quiet; then
-          echo "No file changes to commit."
-        else
-          git commit -m "chore: bump QPKG_VER to $NEW_VERSION (sync OpenListTeam/OpenList ${UPSTREAM_TAG})"
-          git push -u origin "$branch"
-        fi
-        echo "branch=$branch" >> $GITHUB_OUTPUT
+      - name: Update OpenList/qpkg.cfg on master, commit and push
+        if: steps.prep.outputs.version != steps.prep.outputs.current
+        env:
+          NEW_VERSION: ${{ steps.prep.outputs.version }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-    - name: Create tag v${{ steps.prep.outputs.version }} if missing
-      if: steps.prep.outputs.version != steps.prep.outputs.current_ver
-      env:
-        NEW_VERSION: ${{ steps.prep.outputs.version }}
-      run: |
-        set -e
-        tag="v${NEW_VERSION}"
-        if git ls-remote --tags origin | grep -q "refs/tags/${tag}$"; then
-          echo "Tag ${tag} already exists, skipping tag creation."
-        else
-          git tag -a "${tag}" -m "${tag} (sync from OpenListTeam/OpenList)"
-          git push origin "refs/tags/${tag}"
-        fi
+          if [ -f "OpenList/qpkg.cfg" ]; then
+            sed -E -i 's/^(QPKG_VER[[:space:]]*=[[:space:]]*).*/\1"'"$NEW_VERSION"'"/' OpenList/qpkg.cfg || true
+            if ! grep -q '^QPKG_VER' OpenList/qpkg.cfg; then
+              echo "QPKG_VER=\"$NEW_VERSION\"" >> OpenList/qpkg.cfg
+            fi
+          else
+            mkdir -p OpenList
+            echo "QPKG_VER=\"$NEW_VERSION\"" > OpenList/qpkg.cfg
+          fi
 
-    - name: Create or update GitHub release matching upstream type
-      if: steps.prep.outputs.version != steps.prep.outputs.current_ver
-      uses: actions/github-script@v6
-      env:
-        VERSION: ${{ steps.prep.outputs.version }}
-        PRERELEASE: ${{ steps.upstream.outputs.prerelease }}
-        UPSTREAM_TAG: ${{ steps.upstream.outputs.tag_name }}
-        UPSTREAM_URL: ${{ steps.upstream.outputs.html_url }}
-        UPSTREAM_BODY: ${{ steps.upstream.outputs.body }}
-      with:
-        script: |
-          const owner = context.repo.owner;
-          const repo = context.repo.repo;
-          const tag_name = 'v' + process.env.VERSION;
-          const prerelease = (process.env.PRERELEASE === 'true');
-          const body = `Sync from OpenListTeam/OpenList release ${process.env.UPSTREAM_TAG}\n\nUpstream: ${process.env.UPSTREAM_URL}\n\n${process.env.UPSTREAM_BODY}`;
-          try {
-            const existing = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tag_name });
-            core.info(`Release for ${tag_name} already exists (id ${existing.data.id}), updating it.`);
-            await github.rest.repos.updateRelease({
-              owner,
-              repo,
-              release_id: existing.data.id,
-              tag_name,
-              name: tag_name,
-              body,
-              prerelease
-            });
-          } catch (err) {
-            if (err.status === 404) {
-              core.info(`Creating release ${tag_name}`);
-              await github.rest.repos.createRelease({
+          git add OpenList/qpkg.cfg
+          if git diff --staged --quiet; then
+            echo "No changes to commit after editing OpenList/qpkg.cfg."
+          else
+            git commit -m "chore: bump QPKG_VER to ${NEW_VERSION} (sync OpenListTeam/OpenList)"
+            git push origin HEAD:master
+          fi
+
+      - name: Create tag v${{ steps.prep.outputs.version }} if missing
+        if: steps.prep.outputs.version != steps.prep.outputs.current
+        env:
+          NEW_VERSION: ${{ steps.prep.outputs.version }}
+        run: |
+          set -e
+          tag="v${NEW_VERSION}"
+          if git ls-remote --tags origin | grep -q "refs/tags/${tag}$"; then
+            echo "Tag ${tag} already exists; skipping tag creation."
+          else
+            git tag -a "${tag}" -m "${tag} (sync from OpenListTeam/OpenList)"
+            git push origin "refs/tags/${tag}"
+          fi
+
+      - name: Create or update GitHub release for v${{ steps.prep.outputs.version }}
+        if: steps.prep.outputs.version != steps.prep.outputs.current
+        uses: actions/github-script@v6
+        env:
+          VERSION: ${{ steps.prep.outputs.version }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const tag_name = `v${process.env.VERSION}`;
+            const upstream_url = `${{ steps.upstream.outputs.html_url }}`;
+            const upstream_body = `${{ steps.upstream.outputs.body }}`;
+            const body = `Sync from OpenListTeam/OpenList release ${tag_name}\n\nUpstream: ${upstream_url}\n\n${upstream_body}`;
+            try {
+              const existing = await github.rest.repos.getReleaseByTag({ owner, repo, tag: tag_name });
+              core.info(`Release for ${tag_name} already exists (id ${existing.data.id}), updating it.`);
+              await github.rest.repos.updateRelease({
                 owner,
                 repo,
+                release_id: existing.data.id,
                 tag_name,
                 name: tag_name,
                 body,
-                prerelease
+                prerelease: false
               });
-            } else {
-              throw err;
+            } catch (err) {
+              if (err.status === 404) {
+                core.info(`Creating release ${tag_name}`);
+                await github.rest.repos.createRelease({
+                  owner,
+                  repo,
+                  tag_name,
+                  name: tag_name,
+                  body,
+                  prerelease: false
+                });
+              } else {
+                throw err;
+              }
             }
-          }
